@@ -1392,7 +1392,23 @@ end
 --   retry: table of route_retry options. The children are sent to as one
 --          route_retry sub-request, which keeps retrying failed children in
 --          the background after the client has been answered.
+--   max_pending:  back-pressure. When more than this many requests are active
+--                 on a worker thread (not counting requests that only wait for
+--                 a retry), the route waits for its children before answering
+--                 the client, instead of answering at once. A client
+--                 connection does not read further requests while one is
+--                 waiting, so overload slows the clients down rather than
+--                 queueing background requests in memory without bound.
+--                 Needs mcp.active_requests(). Default: off.
+--   pending_wait: maximum seconds to wait in that case (default 0.05). The
+--                 children keep running in the background after a timeout. A
+--                 waiting connection handles about one request per wait, so
+--                 keep it short: it only has to slow the clients down.
+-- Counter in "stats proxy": allasync_throttled (requests that waited).
 function route_allasync_conf(t, ctx)
+    if t.max_pending then
+        t.stats_throttled = ctx:get_stats_id("allasync_throttled")
+    end
     if t.retry then
         -- move the children under a single route_retry child, which keeps
         -- running (and retrying) after the client has been answered.
@@ -1411,10 +1427,25 @@ local function route_allasync_f(rctx, arg)
     local handles = arg.h
     local mut = arg.m
     local nres = rctx:response_new()
+    local max_pending = arg.max_pending
+    local pending_wait = arg.pending_wait
+    local nhandles = #handles
+    local st_throttled = arg.stats_throttled
+    local active = mcp.active_requests
+    local s = mcp.stat
+    local state = routelib_retry_state -- see route_retry
+    local WAIT_ANY = mcp.WAIT_ANY
 
     return function(r)
         rctx:enqueue(r, handles)
-        rctx:wait_cond(0) -- do not wait
+        -- requests parked in a retry loop are bounded by its max_inflight;
+        -- they must not throttle new requests while one pool is down.
+        if max_pending and active() - state.inflight > max_pending then
+            s(st_throttled, 1)
+            rctx:wait_cond(nhandles, WAIT_ANY, pending_wait)
+        else
+            rctx:wait_cond(0) -- do not wait
+        end
         mut(nres, r) -- return a "NULL" response
         return nres
     end
@@ -1430,8 +1461,13 @@ function route_allasync_start(a, ctx, fgen)
         { t = "resnull", idx = 1 }
     )
 
+    if a.max_pending and mcp.active_requests == nil then
+        error("route_allasync: max_pending needs a memcached with mcp.active_requests()")
+    end
+
     fgen:ready({
-        a = { h = o, m = mut },
+        a = { h = o, m = mut, max_pending = a.max_pending, pending_wait = a.pending_wait or 0.05,
+              stats_throttled = a.stats_throttled },
         u = 1,
         n = ctx:label(),
         f = route_allasync_f,

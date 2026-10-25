@@ -263,6 +263,25 @@ route_allasync{
 }
 ```
 
+Since the client is answered before the children finish, nothing slows down a
+client that sends faster than the pools can take requests; the backlog grows
+in memory. `max_pending` adds back-pressure: when more than that many
+requests are active on the worker thread (requests waiting in a `route_retry`
+loop are not counted), the route waits up to `pending_wait` seconds for its
+children before answering. A client connection doesn't send its next request
+while one is waiting, so overloaded clients slow down instead. The wait
+should stay short, since a throttled connection handles about one request
+per `pending_wait`. Requests that waited are counted in `allasync_throttled`.
+Requires a memcached with `mcp.active_requests()`.
+
+```lua
+route_allasync{
+    children = { "poola", "poolb", "poolc" },
+    max_pending = 4000,  -- per worker thread
+    pending_wait = 0.05, -- seconds (default 0.05)
+}
+```
+
 ### `route_retry`
 
 Routes a request to all supplied children and retries the ones that failed,
